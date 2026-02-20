@@ -15,7 +15,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/PeeperLab/paireads.git
+git clone https://github.com/rainoffallingstar/paireads.git
 cd paireads
 
 # Build the tool
@@ -218,4 +218,4 @@ For issues and questions, please open an issue on GitHub.
 
 ---
 
-Made with ❤️ by [PeeperLab](https://github.com/PeeperLab)
+Made with ❤️ by [rainoffallingstar](https://github.com/rainoffallingstar)
