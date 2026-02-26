@@ -10,9 +10,10 @@ import (
 // SortOptions contains options for BAM sorting
 type SortOptions struct {
 	OutputPath string // Output path for sorted BAM
+	ByName     bool   // Sort by read name; false = coordinate sort (default)
 }
 
-// Sort sorts a BAM file by coordinate
+// Sort sorts a BAM file by coordinate or by read name.
 func Sort(inputPath string, opts *SortOptions) error {
 	// Open input file
 	f, err := os.Open(inputPath)
@@ -41,18 +42,22 @@ func Sort(inputPath string, opts *SortOptions) error {
 		return fmt.Errorf("no records to sort")
 	}
 
-	// Sort records by RefID then Position
-	sort.Slice(records, func(i, j int) bool {
-		if records[i].RefID != records[j].RefID {
-			return records[i].RefID < records[j].RefID
-		}
-		return records[i].Pos < records[j].Pos
-	})
-
-	// Create output writer
+	// Sort records
 	header := reader.Header()
-	// Update sort order in header
-	header.SortOrder = "coordinate"
+	if opts.ByName {
+		sort.Slice(records, func(i, j int) bool {
+			return records[i].Name < records[j].Name
+		})
+		header.SortOrder = "queryname"
+	} else {
+		sort.Slice(records, func(i, j int) bool {
+			if records[i].RefID != records[j].RefID {
+				return records[i].RefID < records[j].RefID
+			}
+			return records[i].Pos < records[j].Pos
+		})
+		header.SortOrder = "coordinate"
+	}
 
 	writer, err := NewWriter(opts.OutputPath, header)
 	if err != nil {

@@ -57,11 +57,23 @@ func (w *Writer) writeHeader() error {
 	}
 
 	// Build header text
-	headerText := "@HD\tVN:1.5\tSO:coordinate\n"
+	sortOrder := w.header.SortOrder
+	if sortOrder == "" {
+		sortOrder = "unknown"
+	}
+	headerText := fmt.Sprintf("@HD\tVN:1.5\tSO:%s\n", sortOrder)
 
 	// Add reference sequences
 	for _, ref := range w.header.References {
 		headerText += fmt.Sprintf("@SQ\tSN:%s\tLN:%d\n", ref.Name, ref.Len)
+	}
+
+	// Preserve @RG and @PG lines from input
+	for _, rg := range w.header.RGLines {
+		headerText += rg + "\n"
+	}
+	for _, pg := range w.header.PGLines {
+		headerText += pg + "\n"
 	}
 
 	// Write header length (4 bytes)
@@ -454,6 +466,12 @@ func cigarCharToNum(c byte) byte {
 // Close closes the writer
 func (w *Writer) Close() error {
 	return w.bgz.Close()
+}
+
+// VirtualOffset returns the BAI virtual offset of the next byte to be written
+// to the underlying BGZF stream.
+func (w *Writer) VirtualOffset() int64 {
+	return w.bgz.VirtualOffset()
 }
 
 // WriterAt is a wrapper around Writer that allows writing at a specific position

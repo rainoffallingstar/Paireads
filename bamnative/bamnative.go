@@ -26,9 +26,11 @@ var (
 // Header represents the BAM file header
 type Header struct {
 	Version    string            // Version string (e.g., "1.0" or empty)
-	SortOrder  string            // Sort order (e.g., "coordinate", "unknown")
-	OtherLines map[string]string // Other header lines (@HD, @SQ, @RG, @PG, etc.)
+	SortOrder  string            // Sort order (e.g., "coordinate", "queryname", "unknown")
+	OtherLines map[string]string // Other header lines (non-@RG/@PG lines)
 	References []*Reference      // Reference sequences
+	RGLines    []string          // @RG lines (read group), preserved from input
+	PGLines    []string          // @PG lines (program), preserved from input
 }
 
 // Reference represents a reference sequence (chromosome)
@@ -155,6 +157,12 @@ func (br *Reader) Read() (*Record, error) {
 	return readRecord(br.r, br.header)
 }
 
+// VirtualOffset returns the BAI virtual offset of the next byte to be read
+// from the underlying BGZF stream.
+func (br *Reader) VirtualOffset() int64 {
+	return br.r.VirtualOffset()
+}
+
 // Header returns the BAM header
 func (br *Reader) Header() *Header {
 	return br.header
@@ -230,6 +238,10 @@ func readHeader(r *bgzip.Reader) (*Header, error) {
 				ref.ID = int32(len(header.References))
 				header.References = append(header.References, ref)
 			}
+		case "@RG":
+			header.RGLines = append(header.RGLines, line)
+		case "@PG":
+			header.PGLines = append(header.PGLines, line)
 		default:
 			header.OtherLines[tag] = line
 		}
