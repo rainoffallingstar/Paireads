@@ -86,6 +86,13 @@ func (bg *Reader) Read(p []byte) (int, error) {
 
 		bg.buf = block.Data
 		bg.pos = 0
+
+		// BGZF EOF marker is a valid empty block (0 decompressed bytes).
+		// Return io.EOF now so callers don't loop on (0, nil).
+		if len(bg.buf) == 0 {
+			bg.eof = true
+			return 0, io.EOF
+		}
 	}
 
 	// Copy from buffer to p

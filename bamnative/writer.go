@@ -428,11 +428,11 @@ func seqCharToNum(c byte) byte {
 	case 'C', 'c':
 		return 2
 	case 'G', 'g':
-		return 3
-	case 'T', 't':
 		return 4
+	case 'T', 't':
+		return 8
 	case 'N', 'n':
-		return 5
+		return 15
 	default:
 		return 5
 	}

@@ -632,13 +632,13 @@ func seqBaseToChar(b byte) byte {
 		return 'A'
 	case 2:
 		return 'C'
-	case 3:
-		return 'G'
 	case 4:
+		return 'G'
+	case 8:
 		return 'T'
-	case 5:
+	case 15:
 		return 'N'
 	default:
-		return 'N'
+		return 'N' // other IUPAC ambiguity codes
 	}
 }
