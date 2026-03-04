@@ -523,14 +523,26 @@ func readRecord(r *bgzip.Reader, header *Header) (*Record, error) {
 			arrayLen := int(binary.LittleEndian.Uint32(buf[1:5]))
 			buf = buf[5:]
 
-			// For simplicity, store as byte slice for now
-			if len(buf) < arrayLen {
+			// Determine element size in bytes based on array element type
+			var elemSize int
+			switch arrayType {
+			case 'c', 'C':
+				elemSize = 1
+			case 's', 'S':
+				elemSize = 2
+			case 'i', 'I', 'f':
+				elemSize = 4
+			default:
+				elemSize = 1
+			}
+			byteLen := arrayLen * elemSize
+			if len(buf) < byteLen {
 				return nil, ErrInvalidAux
 			}
 			// Store the array data along with the element type
-			aux.Value = buf[0:arrayLen]
+			aux.Value = buf[0:byteLen]
 			aux.ArrayType = arrayType // Store the array element type separately
-			buf = buf[arrayLen:]
+			buf = buf[byteLen:]
 		default:
 			// Skip unknown aux types - skip 1 byte and continue
 			// Just skip this field to allow reading to continue
