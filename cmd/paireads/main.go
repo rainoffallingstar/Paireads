@@ -12,7 +12,16 @@ import (
 	bamnative "github.com/PeeperLab/xenofilter/bamnative"
 )
 
+var Version = "0.1.0"
+
 func main() {
+	for _, a := range os.Args[1:] {
+		if a == "--version" || a == "-V" {
+			fmt.Printf("paireads %s\n", Version)
+			return
+		}
+	}
+
 	// Pre-scan for --coord-sort flag before positional argument parsing.
 	coordSort := false
 	cleanArgs := make([]string, 0, len(os.Args)-1)
