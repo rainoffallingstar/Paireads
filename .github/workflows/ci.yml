@@ -1,0 +1,119 @@
+name: Paireads CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test-and-bam-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Run Go tests
+        run: |
+          go mod download
+          go test ./...
+
+      - name: Install samtools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y samtools
+
+      - name: Build paireads
+        run: |
+          CGO_ENABLED=0 go build -o ./paireads ./cmd/paireads
+
+      - name: Generate test BAM
+        run: |
+          cat > "$RUNNER_TEMP/gen_paireads_input.go" <<'EOF'
+          package main
+
+          import (
+          	"log"
+          	"os"
+
+          	bamnative "github.com/PeeperLab/xenofilter/bamnative"
+          )
+
+          func main() {
+          	if len(os.Args) != 2 {
+          		log.Fatal("usage: gen <output.bam>")
+          	}
+          	out := os.Args[1]
+          	h := &bamnative.Header{
+          		SortOrder: "coordinate",
+          		References: []*bamnative.Reference{
+          			{ID: 0, Name: "chr1", Len: 1000},
+          		},
+          	}
+          	w, err := bamnative.NewWriter(out, h)
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	recs := []*bamnative.Record{
+          		{
+          			Name:      "pair1",
+          			Flags:     bamnative.FlagPaired | bamnative.FlagProperPair | bamnative.FlagFirstInPair,
+          			RefID:     0,
+          			Pos:       100,
+          			MapQ:      60,
+          			Cigar:     []bamnative.CigarOp{{Op: bamnative.CigarMatch, Len: 5}},
+          			MateRefID: 0,
+          			MatePos:   150,
+          			TLen:      55,
+          			Seq:       "ACGTN",
+          			Qual:      []byte{30, 30, 30, 30, 30},
+          		},
+          		{
+          			Name:      "pair1",
+          			Flags:     bamnative.FlagPaired | bamnative.FlagProperPair | bamnative.FlagSecondInPair,
+          			RefID:     0,
+          			Pos:       150,
+          			MapQ:      60,
+          			Cigar:     []bamnative.CigarOp{{Op: bamnative.CigarMatch, Len: 5}},
+          			MateRefID: 0,
+          			MatePos:   100,
+          			TLen:      -55,
+          			Seq:       "TGCAN",
+          			Qual:      []byte{30, 30, 30, 30, 30},
+          		},
+          	}
+          	for _, r := range recs {
+          		if err := w.Write(r); err != nil {
+          			log.Fatal(err)
+          		}
+          	}
+          	if err := w.Close(); err != nil {
+          		log.Fatal(err)
+          	}
+          }
+          EOF
+          go run "$RUNNER_TEMP/gen_paireads_input.go" "$RUNNER_TEMP/input.bam"
+
+      - name: BAM compatibility gate
+        run: |
+          set -euo pipefail
+          IN_BAM="$RUNNER_TEMP/input.bam"
+          OUT_BAM="$RUNNER_TEMP/output.bam"
+
+          samtools quickcheck "$IN_BAM"
+          samtools view -H "$IN_BAM" >/dev/null
+          samtools view -c "$IN_BAM" >/dev/null
+
+          ./paireads --coord-sort "$IN_BAM" "$OUT_BAM"
+
+          test -f "$OUT_BAM"
+          test -f "$OUT_BAM.bai"
+          samtools quickcheck "$OUT_BAM"
+          samtools view -H "$OUT_BAM" >/dev/null
+          samtools view -c "$OUT_BAM" >/dev/null
