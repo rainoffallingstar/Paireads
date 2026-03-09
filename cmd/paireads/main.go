@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -294,7 +295,10 @@ func extractReadNames(bamPath string) (map[string]bool, error) {
 	for {
 		rec, err := reader.Read()
 		if err != nil {
-			break
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("failed to read BAM record: %w", err)
 		}
 		names[rec.Name] = true
 	}
@@ -325,7 +329,10 @@ func extractReadNameCounts(bamPath string) (map[string]int, int, error) {
 	for {
 		rec, err := reader.Read()
 		if err != nil {
-			break
+			if err == io.EOF {
+				break
+			}
+			return nil, 0, fmt.Errorf("failed to read BAM record: %w", err)
 		}
 		counts[rec.Name]++
 		totalRecords++
@@ -446,7 +453,10 @@ func filterBAM(inputPath, outputPath string, keepNames map[string]bool) error {
 	for {
 		rec, err := reader.Read()
 		if err != nil {
-			break
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to read BAM record: %w", err)
 		}
 		total++
 		if keepNames[rec.Name] {
@@ -493,7 +503,10 @@ func filterBAMWithCount(inputPath, outputPath string, keepNames map[string]bool)
 	for {
 		rec, err := reader.Read()
 		if err != nil {
-			break
+			if err == io.EOF {
+				break
+			}
+			return kept, fmt.Errorf("failed to read BAM record: %w", err)
 		}
 		if keepNames[rec.Name] {
 			if err := writer.Write(rec); err != nil {
