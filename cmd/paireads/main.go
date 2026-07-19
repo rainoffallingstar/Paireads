@@ -99,30 +99,20 @@ func runSingleBAMMode(bamPath, outputPath string, coordSort bool) {
 	fmt.Printf("  Input: %s\n", bamPath)
 	fmt.Printf("  Output: %s\n", outputPath)
 
-	// Step 1: Extract read names and count occurrences
+	// Step 1: inspect primary mate records by read name.
 	fmt.Println("\n[1/3] Analyzing read pair status...")
-	readNameCounts, totalRecords, err := extractReadNameCounts(bamPath)
+	readPairStatuses, totalRecords, err := extractReadPairStatuses(bamPath)
 	if err != nil {
 		fmt.Printf("Error analyzing BAM: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("  Total records: %d\n", totalRecords)
-	fmt.Printf("  Unique read names: %d\n", len(readNameCounts))
+	fmt.Printf("  Unique read names: %d\n", len(readPairStatuses))
 
-	// Identify paired and unpaired reads
-	pairedNames := make(map[string]bool)
-	unpairedNames := make([]string, 0)
+	pairedNames, unpairedNames := classifyCompletePairs(readPairStatuses)
 
-	for name, count := range readNameCounts {
-		if count >= 2 {
-			pairedNames[name] = true
-		} else {
-			unpairedNames = append(unpairedNames, name)
-		}
-	}
-
-	fmt.Printf("  Paired reads (count>=2): %d\n", len(pairedNames))
-	fmt.Printf("  Unpaired reads (count=1): %d\n", len(unpairedNames))
+	fmt.Printf("  Complete primary pairs: %d\n", len(pairedNames))
+	fmt.Printf("  Incomplete or ambiguous read names: %d\n", len(unpairedNames))
 
 	// Save filtered (unpaired) read names to file
 	readnamesPath := strings.TrimSuffix(outputPath, ".bam") + "_filtered_readnames.txt"
@@ -161,9 +151,9 @@ func runSingleBAMMode(bamPath, outputPath string, coordSort bool) {
 	fmt.Println("\nDone!")
 	fmt.Printf("\nSummary:\n")
 	fmt.Printf("  Total input records: %d\n", totalRecords)
-	fmt.Printf("  Unique read names: %d\n", len(readNameCounts))
-	fmt.Printf("  Paired reads (kept): %d\n", len(pairedNames))
-	fmt.Printf("  Unpaired reads (filtered): %d\n", len(unpairedNames))
+	fmt.Printf("  Unique read names: %d\n", len(readPairStatuses))
+	fmt.Printf("  Complete primary pairs (kept): %d\n", len(pairedNames))
+	fmt.Printf("  Incomplete or ambiguous read names (filtered): %d\n", len(unpairedNames))
 	fmt.Printf("  Output records: %d\n", kept)
 	fmt.Printf("\nOutput files:\n")
 	fmt.Printf("  %s\n", outputPath)
@@ -300,6 +290,12 @@ func extractReadNames(bamPath string) (map[string]bool, error) {
 			}
 			return nil, fmt.Errorf("failed to read BAM record: %w", err)
 		}
+		if !isPrimaryMappedRecord(rec) {
+			continue
+		}
+		if names[rec.Name] {
+			return nil, fmt.Errorf("read %q has multiple primary alignments", rec.Name)
+		}
 		names[rec.Name] = true
 	}
 
@@ -310,39 +306,87 @@ func extractReadNames(bamPath string) (map[string]bool, error) {
 	return names, nil
 }
 
-// extractReadNameCounts extracts read names and counts their occurrences.
-func extractReadNameCounts(bamPath string) (map[string]int, int, error) {
-	f, err := os.Open(bamPath)
+// readPairStatus records primary mate multiplicity for one fragment name.
+type readPairStatus struct {
+	firstMateCount  int
+	secondMateCount int
+	invalidPrimary  bool
+}
+
+func isPrimaryMappedRecord(record *bamnative.Record) bool {
+	if record == nil || record.RefID < 0 || record.Flags&bamnative.FlagUnmapped != 0 {
+		return false
+	}
+	return record.Flags&(bamnative.FlagSecondary|bamnative.FlagSupplementary) == 0
+}
+
+func updateReadPairStatus(status *readPairStatus, record *bamnative.Record) {
+	if !isPrimaryMappedRecord(record) {
+		return
+	}
+	if record.Flags&bamnative.FlagPaired == 0 {
+		status.invalidPrimary = true
+		return
+	}
+	isFirstMate := record.Flags&bamnative.FlagFirstInPair != 0
+	isSecondMate := record.Flags&bamnative.FlagSecondInPair != 0
+	if isFirstMate == isSecondMate {
+		status.invalidPrimary = true
+		return
+	}
+	if isFirstMate {
+		status.firstMateCount++
+		return
+	}
+	status.secondMateCount++
+}
+
+func classifyCompletePairs(statuses map[string]readPairStatus) (map[string]bool, []string) {
+	completePairNames := make(map[string]bool)
+	incompleteOrAmbiguousNames := make([]string, 0)
+	for readName, status := range statuses {
+		isUniqueCompletePair := !status.invalidPrimary && status.firstMateCount == 1 && status.secondMateCount == 1
+		if isUniqueCompletePair {
+			completePairNames[readName] = true
+			continue
+		}
+		incompleteOrAmbiguousNames = append(incompleteOrAmbiguousNames, readName)
+	}
+	return completePairNames, incompleteOrAmbiguousNames
+}
+
+// extractReadPairStatuses inspects primary mapped alignments for each fragment.
+func extractReadPairStatuses(bamPath string) (map[string]readPairStatus, int, error) {
+	file, err := os.Open(bamPath)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to open BAM file: %w", err)
 	}
-	defer f.Close()
+	defer file.Close()
 
-	reader, err := bamnative.NewReader(f)
+	reader, err := bamnative.NewReader(file)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create BAM reader: %w", err)
 	}
 
-	counts := make(map[string]int)
+	statuses := make(map[string]readPairStatus)
 	totalRecords := 0
-
 	for {
-		rec, err := reader.Read()
-		if err != nil {
-			if err == io.EOF {
+		record, readErr := reader.Read()
+		if readErr != nil {
+			if readErr == io.EOF {
 				break
 			}
-			return nil, 0, fmt.Errorf("failed to read BAM record: %w", err)
+			return nil, 0, fmt.Errorf("failed to read BAM record: %w", readErr)
 		}
-		counts[rec.Name]++
 		totalRecords++
+		status := statuses[record.Name]
+		updateReadPairStatus(&status, record)
+		statuses[record.Name] = status
 	}
-
 	if totalRecords == 0 {
 		return nil, 0, fmt.Errorf("no records found in BAM file")
 	}
-
-	return counts, totalRecords, nil
+	return statuses, totalRecords, nil
 }
 
 // findCommonNames finds read names that exist in both sets.
@@ -459,7 +503,7 @@ func filterBAM(inputPath, outputPath string, keepNames map[string]bool) error {
 			return fmt.Errorf("failed to read BAM record: %w", err)
 		}
 		total++
-		if keepNames[rec.Name] {
+		if isPrimaryMappedRecord(rec) && keepNames[rec.Name] {
 			if err := writer.Write(rec); err != nil {
 				return fmt.Errorf("failed to write record: %w", err)
 			}
@@ -508,7 +552,7 @@ func filterBAMWithCount(inputPath, outputPath string, keepNames map[string]bool)
 			}
 			return kept, fmt.Errorf("failed to read BAM record: %w", err)
 		}
-		if keepNames[rec.Name] {
+		if isPrimaryMappedRecord(rec) && keepNames[rec.Name] {
 			if err := writer.Write(rec); err != nil {
 				return kept, fmt.Errorf("failed to write record: %w", err)
 			}
