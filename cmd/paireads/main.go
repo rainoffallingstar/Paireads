@@ -1,56 +1,65 @@
-// Command to filter BAM files keeping only properly paired reads
-// This replaces the samtools/picard workflow for filtering unpaired reads
+// Command paireads retains complete primary mate groups or read names shared by two BAMs.
+// It replaces the legacy samtools/Picard filtering workflow while preserving explicit mode semantics.
 package main
 
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
-	bamnative "github.com/PeeperLab/xenofilter/bamnative"
+	bamnative "github.com/rainoffallingstar/Paireads/bamnative"
 )
 
 var Version = "0.1.0"
 
 func main() {
-	for _, a := range os.Args[1:] {
-		if a == "--version" || a == "-V" {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(arguments []string) error {
+	for _, argument := range arguments {
+		switch argument {
+		case "--version", "-V":
 			fmt.Printf("paireads %s\n", Version)
-			return
+			return nil
+		case "--help", "-h":
+			printUsage()
+			return nil
 		}
 	}
 
-	// Pre-scan for --coord-sort flag before positional argument parsing.
-	coordSort := false
-	cleanArgs := make([]string, 0, len(os.Args)-1)
-	for _, a := range os.Args[1:] {
-		if a == "--coord-sort" {
-			coordSort = true
-		} else {
-			cleanArgs = append(cleanArgs, a)
+	coordinateSort := false
+	positionalArguments := make([]string, 0, len(arguments))
+	for _, argument := range arguments {
+		switch argument {
+		case "--coord-sort":
+			coordinateSort = true
+		default:
+			if strings.HasPrefix(argument, "-") {
+				return fmt.Errorf("unknown flag %q", argument)
+			}
+			positionalArguments = append(positionalArguments, argument)
 		}
 	}
 
-	if len(cleanArgs) < 2 {
+	switch len(positionalArguments) {
+	case 2:
+		if !strings.HasSuffix(positionalArguments[0], ".bam") {
+			return fmt.Errorf("single BAM input must end with .bam")
+		}
+		return runSingleBAMMode(positionalArguments[0], positionalArguments[1], coordinateSort)
+	case 3:
+		return runDualBAMMode(positionalArguments[0], positionalArguments[1], positionalArguments[2], coordinateSort)
+	default:
 		printUsage()
-		os.Exit(1)
+		return fmt.Errorf("expected two arguments for single mode or three arguments for dual mode")
 	}
-
-	// Single BAM mode: paireads [--coord-sort] <input.bam> <output.bam>
-	if len(cleanArgs) == 2 && strings.HasSuffix(cleanArgs[0], ".bam") && !strings.HasPrefix(cleanArgs[1], "-") {
-		runSingleBAMMode(cleanArgs[0], cleanArgs[1], coordSort)
-		return
-	}
-
-	// Dual BAM mode: paireads [--coord-sort] <R1.bam> <R2.bam> <output_prefix>
-	if len(cleanArgs) < 3 {
-		printUsage()
-		os.Exit(1)
-	}
-	runDualBAMMode(cleanArgs[0], cleanArgs[1], cleanArgs[2], coordSort)
 }
 
 func printUsage() {
@@ -63,20 +72,20 @@ func printUsage() {
 	fmt.Println("                  Default (without this flag): name-sort the output, no index.")
 	fmt.Println()
 	fmt.Println("Single BAM mode:")
-	fmt.Println("  Filters a merged paired-end BAM file, keeping only reads with proper pairs.")
-	fmt.Println("  Reads that appear only once (unpaired) are filtered out.")
+	fmt.Println("  Retains read names with exactly one primary mapped R1 and one primary mapped R2 record.")
+	fmt.Println("  This is a complete-primary-mates contract, not a SAM FlagProperPair assertion.")
 	fmt.Println()
 	fmt.Println("Dual BAM mode:")
-	fmt.Println("  1. Extracts read names from both R1 and R2 BAM files")
-	fmt.Println("  2. Finds reads that exist in BOTH files (properly paired)")
-	fmt.Println("  3. Filters both R1 and R2 to keep only paired reads")
-	fmt.Println("  4. Sorts (and optionally indexes) the output BAM files")
+	fmt.Println("  1. Externally name-sorts both BAM files")
+	fmt.Println("  2. Streams unique primary mapped read names present in BOTH files")
+	fmt.Println("  3. Writes matched primary records to separate R1 and R2 outputs")
+	fmt.Println("  4. Sorts and optionally indexes the output BAM files")
 	fmt.Println()
 	fmt.Println("Output files (single mode, without --coord-sort):")
-	fmt.Println("  <output.bam>     - Filtered BAM with only paired reads (name-sorted)")
+	fmt.Println("  <output.bam>     - Complete primary mate groups (name-sorted)")
 	fmt.Println()
 	fmt.Println("Output files (single mode, with --coord-sort):")
-	fmt.Println("  <output.bam>     - Filtered BAM with only paired reads (coordinate-sorted)")
+	fmt.Println("  <output.bam>     - Complete primary mate groups (coordinate-sorted)")
 	fmt.Println("  <output.bam>.bai - BAI index")
 	fmt.Println()
 	fmt.Println("Output files (dual mode, without --coord-sort):")
@@ -93,217 +102,254 @@ func printUsage() {
 }
 
 // runSingleBAMMode processes a single merged paired-end BAM file
-// and filters out unpaired reads (reads that appear only once).
-func runSingleBAMMode(bamPath, outputPath string, coordSort bool) {
+// and filters out incomplete or ambiguous primary mate groups.
+func runSingleBAMMode(bamPath, outputPath string, coordinateSort bool) error {
+	readnamesPath := strings.TrimSuffix(outputPath, ".bam") + "_filtered_readnames.txt"
+	pathRoles := []filePathRole{
+		{label: "input BAM", path: bamPath},
+		{label: "output BAM", path: outputPath},
+		{label: "output BAM index", path: outputPath + ".bai"},
+		{label: "filtered read names", path: readnamesPath},
+	}
+	if err := validateDistinctFilePaths(pathRoles); err != nil {
+		return err
+	}
+
 	fmt.Printf("Processing single merged paired-end BAM file:\n")
 	fmt.Printf("  Input: %s\n", bamPath)
 	fmt.Printf("  Output: %s\n", outputPath)
 
-	// Step 1: inspect primary mate records by read name.
-	fmt.Println("\n[1/3] Analyzing read pair status...")
-	readPairStatuses, totalRecords, err := extractReadPairStatuses(bamPath)
+	temporaryDirectory, err := os.MkdirTemp("", "paireads-single-*")
 	if err != nil {
-		fmt.Printf("Error analyzing BAM: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("create temporary directory: %w", err)
 	}
-	fmt.Printf("  Total records: %d\n", totalRecords)
-	fmt.Printf("  Unique read names: %d\n", len(readPairStatuses))
+	defer os.RemoveAll(temporaryDirectory)
 
-	pairedNames, unpairedNames := classifyCompletePairs(readPairStatuses)
-
-	fmt.Printf("  Complete primary pairs: %d\n", len(pairedNames))
-	fmt.Printf("  Incomplete or ambiguous read names: %d\n", len(unpairedNames))
-
-	// Save filtered (unpaired) read names to file
-	readnamesPath := strings.TrimSuffix(outputPath, ".bam") + "_filtered_readnames.txt"
-	if len(unpairedNames) > 0 {
-		if err := saveReadNamesList(unpairedNames, readnamesPath); err != nil {
-			fmt.Printf("Warning: Failed to save filtered read names: %v\n", err)
-		} else {
-			fmt.Printf("  Saved filtered read names to: %s\n", readnamesPath)
-		}
-	}
-
-	// Step 2: Filter BAM to keep only paired reads
-	fmt.Println("\n[2/3] Filtering BAM to keep only paired reads...")
-	kept, err := filterBAMWithCount(bamPath, outputPath, pairedNames)
+	fmt.Println("\n[1/3] Name-sorting input and analyzing read pair status...")
+	nameSortedPath, err := prepareNameSortedInput(bamPath, temporaryDirectory, "input")
 	if err != nil {
-		fmt.Printf("Error filtering BAM: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	fmt.Printf("  Kept %d out of %d records\n", kept, totalRecords)
 
-	// Step 3: Sort (and optionally index)
-	if coordSort {
+	rawStagedPath, err := createStagedArtifactPath(outputPath, ".raw.bam")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(rawStagedPath)
+	finalStagedPath, err := createStagedArtifactPath(outputPath, ".bam")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(finalStagedPath)
+	defer os.Remove(finalStagedPath + ".bai")
+	readnamesStagedPath, err := createStagedArtifactPath(readnamesPath, ".txt")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(readnamesStagedPath)
+
+	streamResult, err := streamSingleNameGroups(nameSortedPath, rawStagedPath, readnamesStagedPath)
+	if err != nil {
+		return fmt.Errorf("stream single-BAM groups: %w", err)
+	}
+	fmt.Printf("  Total records: %d\n", streamResult.totalRecords)
+	fmt.Printf("  Unique read names: %d\n", streamResult.uniqueReadNames)
+	fmt.Printf("  Complete primary pairs: %d\n", streamResult.completePairNames)
+	fmt.Printf("  Incomplete or ambiguous read names: %d\n", streamResult.filteredReadNames)
+
+	fmt.Println("\n[2/3] Finalizing retained primary mate groups...")
+	fmt.Printf("  Kept %d out of %d records\n", streamResult.keptPrimaryRecords, streamResult.totalRecords)
+
+	if coordinateSort {
 		fmt.Println("\n[3/3] Coordinate-sorting and indexing...")
-		if err := sortAndIndex(outputPath); err != nil {
-			fmt.Printf("Warning: coord-sort/index failed: %v\n", err)
-		} else {
-			fmt.Printf("  Sorted and indexed: %s.bai\n", outputPath)
-		}
 	} else {
 		fmt.Println("\n[3/3] Name-sorting output...")
-		if err := nameSort(outputPath); err != nil {
-			fmt.Printf("Warning: name-sort failed: %v\n", err)
+	}
+	if err := sortBAM(rawStagedPath, finalStagedPath, coordinateSort); err != nil {
+		return err
+	}
+	if coordinateSort {
+		if err := bamnative.BuildIndex(finalStagedPath); err != nil {
+			return fmt.Errorf("build staged BAM index: %w", err)
 		}
+	}
+
+	artifacts := []stagedArtifact{
+		{stagedPath: finalStagedPath, targetPath: outputPath},
+		{stagedPath: readnamesStagedPath, targetPath: readnamesPath},
+	}
+	if coordinateSort {
+		artifacts = append(artifacts, stagedArtifact{stagedPath: finalStagedPath + ".bai", targetPath: outputPath + ".bai"})
+	} else {
+		artifacts = append(artifacts, stagedArtifact{targetPath: outputPath + ".bai", removeTarget: true})
+	}
+	if err := publishArtifacts(artifacts); err != nil {
+		return fmt.Errorf("publish single-BAM outputs: %w", err)
 	}
 
 	fmt.Println("\nDone!")
 	fmt.Printf("\nSummary:\n")
-	fmt.Printf("  Total input records: %d\n", totalRecords)
-	fmt.Printf("  Unique read names: %d\n", len(readPairStatuses))
-	fmt.Printf("  Complete primary pairs (kept): %d\n", len(pairedNames))
-	fmt.Printf("  Incomplete or ambiguous read names (filtered): %d\n", len(unpairedNames))
-	fmt.Printf("  Output records: %d\n", kept)
+	fmt.Printf("  Total input records: %d\n", streamResult.totalRecords)
+	fmt.Printf("  Unique read names: %d\n", streamResult.uniqueReadNames)
+	fmt.Printf("  Complete primary pairs (kept): %d\n", streamResult.completePairNames)
+	fmt.Printf("  Incomplete or ambiguous read names (filtered): %d\n", streamResult.filteredReadNames)
+	fmt.Printf("  Output records: %d\n", streamResult.keptPrimaryRecords)
 	fmt.Printf("\nOutput files:\n")
 	fmt.Printf("  %s\n", outputPath)
-	if coordSort {
+	if coordinateSort {
 		fmt.Printf("  %s.bai\n", outputPath)
 	}
-	if len(unpairedNames) > 0 {
-		fmt.Printf("  %s\n", readnamesPath)
-	}
+	fmt.Printf("  %s\n", readnamesPath)
+	return nil
 }
 
 // runDualBAMMode processes two separate R1/R2 BAM files, keeping only reads
 // present in both, then sorts (and optionally indexes) the outputs.
-func runDualBAMMode(r1Path, r2Path, outputPrefix string, coordSort bool) {
+func runDualBAMMode(r1Path, r2Path, outputPrefix string, coordinateSort bool) error {
 	outputR1 := outputPrefix + "_R1.bam"
 	outputR2 := outputPrefix + "_R2.bam"
+	readnamesPath := outputPrefix + "_filtered_readnames.txt"
+	pathRoles := []filePathRole{
+		{label: "R1 input BAM", path: r1Path},
+		{label: "R2 input BAM", path: r2Path},
+		{label: "R1 output BAM", path: outputR1},
+		{label: "R2 output BAM", path: outputR2},
+		{label: "R1 output BAM index", path: outputR1 + ".bai"},
+		{label: "R2 output BAM index", path: outputR2 + ".bai"},
+		{label: "filtered read names", path: readnamesPath},
+	}
+	if err := validateDistinctFilePaths(pathRoles); err != nil {
+		return err
+	}
 
 	fmt.Printf("Processing paired-end BAM files:\n")
 	fmt.Printf("  R1: %s\n", r1Path)
 	fmt.Printf("  R2: %s\n", r2Path)
 	fmt.Printf("  Output prefix: %s\n", outputPrefix)
 
-	// Step 1: Extract read names from R1
-	fmt.Println("\n[1/6] Extracting read names from R1...")
-	r1Names, err := extractReadNames(r1Path)
+	temporaryDirectory, err := os.MkdirTemp("", "paireads-dual-*")
 	if err != nil {
-		fmt.Printf("Error extracting R1 names: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("create temporary directory: %w", err)
 	}
-	fmt.Printf("  Found %d reads in R1\n", len(r1Names))
+	defer os.RemoveAll(temporaryDirectory)
 
-	// Step 2: Extract read names from R2
-	fmt.Println("\n[2/6] Extracting read names from R2...")
-	r2Names, err := extractReadNames(r2Path)
+	fmt.Println("\n[1/6] Name-sorting R1 input...")
+	r1NameSortedPath, err := prepareNameSortedInput(r1Path, temporaryDirectory, "r1")
 	if err != nil {
-		fmt.Printf("Error extracting R2 names: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	fmt.Printf("  Found %d reads in R2\n", len(r2Names))
-
-	// Step 3: Find common read names (paired reads) and unpaired reads
-	fmt.Println("\n[3/6] Finding common read names (properly paired)...")
-	commonNames, unpairedNames := findCommonNames(r1Names, r2Names)
-	fmt.Printf("  Found %d properly paired reads\n", len(commonNames))
-	fmt.Printf("  Found %d unpaired reads (to be filtered out)\n", len(unpairedNames))
-
-	// Save filtered (unpaired) read names to file
-	readnamesPath := outputPrefix + "_filtered_readnames.txt"
-	if err := saveReadNames(unpairedNames, readnamesPath); err != nil {
-		fmt.Printf("Warning: Failed to save filtered read names: %v\n", err)
-	} else {
-		fmt.Printf("  Saved filtered read names to: %s\n", readnamesPath)
+	fmt.Println("\n[2/6] Name-sorting R2 input...")
+	r2NameSortedPath, err := prepareNameSortedInput(r2Path, temporaryDirectory, "r2")
+	if err != nil {
+		return err
 	}
+	fmt.Println("\n[3/6] Streaming matched read names...")
 
-	// Step 4: Filter R1 BAM
-	fmt.Println("\n[4/6] Filtering R1 BAM to keep only paired reads...")
-	if err := filterBAM(r1Path, outputR1, commonNames); err != nil {
-		fmt.Printf("Error filtering R1 BAM: %v\n", err)
-		os.Exit(1)
+	rawR1Path, err := createStagedArtifactPath(outputR1, ".raw.bam")
+	if err != nil {
+		return err
 	}
-
-	// Step 5: Filter R2 BAM
-	fmt.Println("\n[5/6] Filtering R2 BAM to keep only paired reads...")
-	if err := filterBAM(r2Path, outputR2, commonNames); err != nil {
-		fmt.Printf("Error filtering R2 BAM: %v\n", err)
-		os.Exit(1)
+	defer os.Remove(rawR1Path)
+	rawR2Path, err := createStagedArtifactPath(outputR2, ".raw.bam")
+	if err != nil {
+		return err
 	}
+	defer os.Remove(rawR2Path)
+	finalR1Path, err := createStagedArtifactPath(outputR1, ".bam")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(finalR1Path)
+	defer os.Remove(finalR1Path + ".bai")
+	finalR2Path, err := createStagedArtifactPath(outputR2, ".bam")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(finalR2Path)
+	defer os.Remove(finalR2Path + ".bai")
+	readnamesStagedPath, err := createStagedArtifactPath(readnamesPath, ".txt")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(readnamesStagedPath)
 
-	// Step 6: Sort (and optionally index) both outputs
-	if coordSort {
+	streamResult, err := streamDualNameGroups(
+		r1NameSortedPath,
+		r2NameSortedPath,
+		rawR1Path,
+		rawR2Path,
+		readnamesStagedPath,
+	)
+	if err != nil {
+		return fmt.Errorf("stream dual-BAM groups: %w", err)
+	}
+	fmt.Printf("  Found %d unique primary names in R1\n", streamResult.r1ReadNames)
+	fmt.Printf("  Found %d unique primary names in R2\n", streamResult.r2ReadNames)
+	fmt.Printf("  Found %d matched read names\n", streamResult.matchedReadNames)
+	fmt.Printf("  Found %d unmatched read names\n", streamResult.unmatchedReadNames)
+
+	fmt.Println("\n[4/6] Finalized matched R1 records.")
+	fmt.Println("\n[5/6] Finalized matched R2 records.")
+
+	if coordinateSort {
 		fmt.Println("\n[6/6] Coordinate-sorting and indexing output BAM files...")
-		if err := sortAndIndex(outputR1); err != nil {
-			fmt.Printf("Warning: R1 sort/index failed: %v\n", err)
-		} else {
-			fmt.Printf("  R1 sorted and indexed successfully\n")
-		}
-		if err := sortAndIndex(outputR2); err != nil {
-			fmt.Printf("Warning: R2 sort/index failed: %v\n", err)
-		} else {
-			fmt.Printf("  R2 sorted and indexed successfully\n")
-		}
 	} else {
 		fmt.Println("\n[6/6] Name-sorting output BAM files...")
-		if err := nameSort(outputR1); err != nil {
-			fmt.Printf("Warning: R1 name-sort failed: %v\n", err)
-		} else {
-			fmt.Printf("  R1 name-sorted successfully\n")
+	}
+	if err := sortBAM(rawR1Path, finalR1Path, coordinateSort); err != nil {
+		return fmt.Errorf("prepare R1 output: %w", err)
+	}
+	if err := sortBAM(rawR2Path, finalR2Path, coordinateSort); err != nil {
+		return fmt.Errorf("prepare R2 output: %w", err)
+	}
+	if coordinateSort {
+		if err := bamnative.BuildIndex(finalR1Path); err != nil {
+			return fmt.Errorf("build staged R1 index: %w", err)
 		}
-		if err := nameSort(outputR2); err != nil {
-			fmt.Printf("Warning: R2 name-sort failed: %v\n", err)
-		} else {
-			fmt.Printf("  R2 name-sorted successfully\n")
+		if err := bamnative.BuildIndex(finalR2Path); err != nil {
+			return fmt.Errorf("build staged R2 index: %w", err)
 		}
+	}
+
+	artifacts := []stagedArtifact{
+		{stagedPath: finalR1Path, targetPath: outputR1},
+		{stagedPath: finalR2Path, targetPath: outputR2},
+		{stagedPath: readnamesStagedPath, targetPath: readnamesPath},
+	}
+	if coordinateSort {
+		artifacts = append(
+			artifacts,
+			stagedArtifact{stagedPath: finalR1Path + ".bai", targetPath: outputR1 + ".bai"},
+			stagedArtifact{stagedPath: finalR2Path + ".bai", targetPath: outputR2 + ".bai"},
+		)
+	} else {
+		artifacts = append(
+			artifacts,
+			stagedArtifact{targetPath: outputR1 + ".bai", removeTarget: true},
+			stagedArtifact{targetPath: outputR2 + ".bai", removeTarget: true},
+		)
+	}
+	if err := publishArtifacts(artifacts); err != nil {
+		return fmt.Errorf("publish dual-BAM outputs: %w", err)
 	}
 
 	fmt.Println("\nDone!")
 	fmt.Printf("\nSummary:\n")
-	fmt.Printf("  R1 reads: %d\n", len(r1Names))
-	fmt.Printf("  R2 reads: %d\n", len(r2Names))
-	fmt.Printf("  Paired reads (kept): %d\n", len(commonNames))
-	fmt.Printf("  Unpaired reads (filtered out): %d\n", len(unpairedNames))
+	fmt.Printf("  R1 unique primary names: %d\n", streamResult.r1ReadNames)
+	fmt.Printf("  R2 unique primary names: %d\n", streamResult.r2ReadNames)
+	fmt.Printf("  Matched read names (kept): %d\n", streamResult.matchedReadNames)
+	fmt.Printf("  Unmatched read names (filtered out): %d\n", streamResult.unmatchedReadNames)
 	fmt.Printf("\nOutput files:\n")
 	fmt.Printf("  %s\n", outputR1)
-	if coordSort {
+	if coordinateSort {
 		fmt.Printf("  %s.bai\n", outputR1)
 	}
 	fmt.Printf("  %s\n", outputR2)
-	if coordSort {
+	if coordinateSort {
 		fmt.Printf("  %s.bai\n", outputR2)
 	}
 	fmt.Printf("  %s\n", readnamesPath)
-}
-
-// extractReadNames extracts all read names from a BAM file
-func extractReadNames(bamPath string) (map[string]bool, error) {
-	f, err := os.Open(bamPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open BAM file: %w", err)
-	}
-	defer f.Close()
-
-	reader, err := bamnative.NewReader(f)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create BAM reader: %w", err)
-	}
-
-	names := make(map[string]bool)
-
-	for {
-		rec, err := reader.Read()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, fmt.Errorf("failed to read BAM record: %w", err)
-		}
-		if !isPrimaryMappedRecord(rec) {
-			continue
-		}
-		if names[rec.Name] {
-			return nil, fmt.Errorf("read %q has multiple primary alignments", rec.Name)
-		}
-		names[rec.Name] = true
-	}
-
-	if len(names) == 0 {
-		return nil, fmt.Errorf("no reads found in BAM file")
-	}
-
-	return names, nil
+	return nil
 }
 
 // readPairStatus records primary mate multiplicity for one fragment name.
@@ -341,265 +387,44 @@ func updateReadPairStatus(status *readPairStatus, record *bamnative.Record) {
 	status.secondMateCount++
 }
 
-func classifyCompletePairs(statuses map[string]readPairStatus) (map[string]bool, []string) {
-	completePairNames := make(map[string]bool)
-	incompleteOrAmbiguousNames := make([]string, 0)
-	for readName, status := range statuses {
-		isUniqueCompletePair := !status.invalidPrimary && status.firstMateCount == 1 && status.secondMateCount == 1
-		if isUniqueCompletePair {
-			completePairNames[readName] = true
-			continue
-		}
-		incompleteOrAmbiguousNames = append(incompleteOrAmbiguousNames, readName)
-	}
-	return completePairNames, incompleteOrAmbiguousNames
-}
-
-// extractReadPairStatuses inspects primary mapped alignments for each fragment.
-func extractReadPairStatuses(bamPath string) (map[string]readPairStatus, int, error) {
-	file, err := os.Open(bamPath)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to open BAM file: %w", err)
-	}
-	defer file.Close()
-
-	reader, err := bamnative.NewReader(file)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to create BAM reader: %w", err)
-	}
-
-	statuses := make(map[string]readPairStatus)
-	totalRecords := 0
-	for {
-		record, readErr := reader.Read()
-		if readErr != nil {
-			if readErr == io.EOF {
-				break
-			}
-			return nil, 0, fmt.Errorf("failed to read BAM record: %w", readErr)
-		}
-		totalRecords++
-		status := statuses[record.Name]
-		updateReadPairStatus(&status, record)
-		statuses[record.Name] = status
-	}
-	if totalRecords == 0 {
-		return nil, 0, fmt.Errorf("no records found in BAM file")
-	}
-	return statuses, totalRecords, nil
-}
-
-// findCommonNames finds read names that exist in both sets.
-// Also returns the unpaired (filtered) read names.
-func findCommonNames(r1, r2 map[string]bool) (common, unpaired map[string]bool) {
-	common = make(map[string]bool)
-	unpaired = make(map[string]bool)
-
-	if len(r1) < len(r2) {
-		for name := range r1 {
-			if r2[name] {
-				common[name] = true
-			} else {
-				unpaired[name] = true
-			}
-		}
-		for name := range r2 {
-			if !r1[name] {
-				unpaired[name] = true
-			}
-		}
-	} else {
-		for name := range r2 {
-			if r1[name] {
-				common[name] = true
-			} else {
-				unpaired[name] = true
-			}
-		}
-		for name := range r1 {
-			if !r2[name] {
-				unpaired[name] = true
-			}
-		}
-	}
-
-	return common, unpaired
-}
-
-// saveReadNames saves a map of read names to a file (one per line, sorted).
-func saveReadNames(names map[string]bool, path string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	sortedNames := make([]string, 0, len(names))
-	for name := range names {
-		sortedNames = append(sortedNames, name)
-	}
-	sort.Strings(sortedNames)
-
-	writer := bufio.NewWriter(f)
-	for _, name := range sortedNames {
-		if _, err := writer.WriteString(name + "\n"); err != nil {
-			return err
-		}
-	}
-	return writer.Flush()
-}
-
 // saveReadNamesList saves a slice of read names to a file (one per line, sorted).
 func saveReadNamesList(names []string, path string) error {
-	f, err := os.Create(path)
+	outputFile, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
-	sortedNames := make([]string, len(names))
-	copy(sortedNames, names)
+	sortedNames := append([]string(nil), names...)
 	sort.Strings(sortedNames)
-
-	writer := bufio.NewWriter(f)
+	writer := bufio.NewWriter(outputFile)
 	for _, name := range sortedNames {
 		if _, err := writer.WriteString(name + "\n"); err != nil {
+			_ = outputFile.Close()
 			return err
 		}
 	}
-	return writer.Flush()
-}
-
-// filterBAM reads a BAM file and writes only records with matching read names.
-func filterBAM(inputPath, outputPath string, keepNames map[string]bool) error {
-	f, err := os.Open(inputPath)
-	if err != nil {
-		return fmt.Errorf("failed to open input BAM: %w", err)
-	}
-	defer f.Close()
-
-	reader, err := bamnative.NewReader(f)
-	if err != nil {
-		return fmt.Errorf("failed to create BAM reader: %w", err)
-	}
-
-	header := reader.Header()
-
-	writer, err := bamnative.NewWriter(outputPath, header)
-	if err != nil {
-		return fmt.Errorf("failed to create BAM writer: %w", err)
-	}
-	defer writer.Close()
-
-	kept := 0
-	total := 0
-
-	for {
-		rec, err := reader.Read()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("failed to read BAM record: %w", err)
-		}
-		total++
-		if isPrimaryMappedRecord(rec) && keepNames[rec.Name] {
-			if err := writer.Write(rec); err != nil {
-				return fmt.Errorf("failed to write record: %w", err)
-			}
-			kept++
-		}
-	}
-
-	if kept != total {
-		fmt.Printf("  Kept %d out of %d records\n", kept, total)
-	} else {
-		fmt.Printf("  Kept all %d records\n", kept)
-	}
-
-	return nil
-}
-
-// filterBAMWithCount reads a BAM file and writes only records with matching read names.
-// Returns the number of kept records.
-func filterBAMWithCount(inputPath, outputPath string, keepNames map[string]bool) (int, error) {
-	f, err := os.Open(inputPath)
-	if err != nil {
-		return 0, fmt.Errorf("failed to open input BAM: %w", err)
-	}
-	defer f.Close()
-
-	reader, err := bamnative.NewReader(f)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create BAM reader: %w", err)
-	}
-
-	header := reader.Header()
-
-	writer, err := bamnative.NewWriter(outputPath, header)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create BAM writer: %w", err)
-	}
-	defer writer.Close()
-
-	kept := 0
-
-	for {
-		rec, err := reader.Read()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return kept, fmt.Errorf("failed to read BAM record: %w", err)
-		}
-		if isPrimaryMappedRecord(rec) && keepNames[rec.Name] {
-			if err := writer.Write(rec); err != nil {
-				return kept, fmt.Errorf("failed to write record: %w", err)
-			}
-			kept++
-		}
-	}
-
-	return kept, nil
-}
-
-// sortAndIndex coordinate-sorts a BAM file in-place and creates a BAI index.
-func sortAndIndex(bamPath string) error {
-	sortedPath := strings.TrimSuffix(bamPath, ".bam") + "_sorted.bam"
-
-	if err := bamnative.Sort(bamPath, &bamnative.SortOptions{OutputPath: sortedPath}); err != nil {
-		return fmt.Errorf("failed to sort BAM: %w", err)
-	}
-
-	if err := os.Remove(bamPath); err != nil {
-		return fmt.Errorf("failed to remove original file: %w", err)
-	}
-
-	if err := os.Rename(sortedPath, bamPath); err != nil {
-		return fmt.Errorf("failed to rename sorted file: %w", err)
-	}
-
-	if err := bamnative.BuildIndex(bamPath); err != nil {
-		return fmt.Errorf("failed to create index: %w", err)
-	}
-
-	return nil
-}
-
-// nameSort name-sorts a BAM file in-place (no index created).
-func nameSort(bamPath string) error {
-	sortedPath := strings.TrimSuffix(bamPath, ".bam") + "_nsorted.bam"
-
-	if err := bamnative.Sort(bamPath, &bamnative.SortOptions{
-		OutputPath: sortedPath,
-		ByName:     true,
-	}); err != nil {
-		return fmt.Errorf("failed to name-sort BAM: %w", err)
-	}
-
-	if err := os.Remove(bamPath); err != nil {
+	if err := writer.Flush(); err != nil {
+		_ = outputFile.Close()
 		return err
 	}
+	if err := outputFile.Close(); err != nil {
+		return err
+	}
+	return nil
+}
 
-	return os.Rename(sortedPath, bamPath)
+// sortBAM sorts inputPath into outputPath without replacing either path.
+func sortBAM(inputPath, outputPath string, coordinateSort bool) error {
+	if err := bamnative.Sort(inputPath, &bamnative.SortOptions{
+		OutputPath:         outputPath,
+		ByName:             !coordinateSort,
+		MemoryLimitBytes:   paireadsSortMemoryLimitBytes,
+		TemporaryDirectory: filepath.Dir(outputPath),
+	}); err != nil {
+		if coordinateSort {
+			return fmt.Errorf("coordinate-sort BAM: %w", err)
+		}
+		return fmt.Errorf("name-sort BAM: %w", err)
+	}
+	return nil
 }
